@@ -233,19 +233,104 @@ function parseAutolink(s, i, n) {
 }
 
 // ---- Find a code span starting at s[i] === '`'. Returns [end, a, b] (content slice) or null. ----
-function findCodeSpan(s, i, n) {
+// `limit` (default n): the closing backtick run must end at or before it.
+function findCodeSpan(s, i, n, limit) {
+  if (limit === undefined) limit = n;
   let k = i;
   while (k < n && s.charCodeAt(k) === 96) k++;
   const run = k - i;
   let j = k;
   for (;;) {
     const e = s.indexOf('`', j);
-    if (e === -1) return null;
+    if (e === -1 || e >= limit) return null;
     let m = e;
     while (m < n && s.charCodeAt(m) === 96) m++;
-    if (m - e === run) return [m, k, e];
+    if (m - e === run && m <= limit) return [m, k, e];
     j = m;
   }
+}
+// Find the ']' closing the innermost open bracket, scanning from s[i].
+// Depth-counts nested '['; skips backslash escapes. Returns -1 if none.
+function findBracketClose(s, i, n) {
+  let depth = 1;
+  for (let j = i; j < n; j++) {
+    const c = s.charCodeAt(j);
+    if (c === 92) { j++; continue; } // \x escape
+    if (c === 91) depth++;
+    else if (c === 93) { depth--; if (depth === 0) return j; }
+  }
+  return -1;
+}
+// Does `text` fully match marked's _inlineLabel (link text)? Backticks must
+// form a code-span pattern (`+ [^`]*? `+, runs need not match) or be a 2+ run
+// right before ']'; a lone unmatched backtick makes the label invalid, so the
+// link does not form (cm-342/525/537). Brackets nest to two levels.
+function isValidLabel(text) {
+  const n = text.length;
+  const memo = new Array(n + 1).fill(-1); // -1 unknown, 0 false, 1 true
+  function validFrom(i) {
+    if (i >= n) return true;
+    if (memo[i] !== -1) return memo[i] === 1;
+    let res = false;
+    const c = text.charCodeAt(i);
+    if (c === 92) { // escape: \\[\s\S]
+      res = i + 1 < n && validFrom(i + 2);
+    } else if (c === 91) { // nested bracket (up to 2 levels)
+      let j = i + 1, ok = false;
+      while (j < n) {
+        const d = text.charCodeAt(j);
+        if (d === 92) { j += 2; continue; }
+        if (d === 91) { // inner bracket: \[ (?:esc|non-bracket)* \]
+          let k = j + 1, closed = false;
+          while (k < n) {
+            const e = text.charCodeAt(k);
+            if (e === 92) { k += 2; continue; }
+            if (e === 93) { closed = true; break; }
+            if (e === 91) break; // third level not allowed
+            k++;
+          }
+          if (!closed) { j = n; break; }
+          j = k + 1; continue;
+        }
+        if (d === 93) { ok = true; break; }
+        j++;
+      }
+      res = ok && validFrom(j + 1);
+    } else if (c === 96) { // backtick
+      let r = i;
+      while (r < n && text.charCodeAt(r) === 96) r++;
+      const runLen = r - i;
+      let done = false;
+      // code span: try each later backtick run as the closer (shortest first)
+      let j = r;
+      while (j < n && !done) {
+        const nb = text.indexOf('`', j);
+        if (nb === -1) break;
+        let m = nb;
+        while (m < n && text.charCodeAt(m) === 96) m++;
+        if (validFrom(m)) { done = true; break; }
+        j = m;
+      }
+      // 2+ backticks at the very end (right before ']')
+      if (!done && runLen >= 2 && r === n) done = true;
+      res = done;
+    } else if (c === 93) {
+      res = false; // bare ']' not allowed in a label
+    } else {
+      res = validFrom(i + 1);
+    }
+    memo[i] = res ? 1 : 0;
+    return res;
+  }
+  return validFrom(0);
+}
+// Will a link form from the bracket closing at s[cb]? Inline and full/collapsed
+// refs need a valid _inlineLabel; shortcuts use the permissive _blockLabel.
+function willFormLink(s, cb, n, refs, linkText) {
+  const suf = parseLinkSuffix(s, cb + 1, n, refs, linkText);
+  if (suf === null) return false;
+  if (suf.end === cb + 1) return true; // shortcut ref
+  return isValidLabel(linkText);
 }
 // Render code span content [a,b) of s into out (newline->space, strip one edge space, escape 5).
 function codeSpanInto(out, s, a, b) {
@@ -673,7 +758,18 @@ function inlineTo(s, refs, out, noExt) {
       i++; continue;
     }
     if (c === 96) { // backtick
-      const cs = findCodeSpan(s, i, n);
+      // inside link text a code span cannot cross the closing ']' when a link
+      // will form there (marked lexes link text separately); if the label is
+      // invalid the code span may cross it and the link does not form (cm-342)
+      let cs = null;
+      if (inBrackets()) {
+        const cb = findBracketClose(s, i, n);
+        if (cb !== -1) {
+          const brPos = toks[openers[openers.length - 1]][1];
+          const linkText = s.slice(brPos + 1, cb);
+          cs = willFormLink(s, cb, n, refs, linkText) ? findCodeSpan(s, i, n, cb) : findCodeSpan(s, i, n);
+        } else cs = findCodeSpan(s, i, n);
+      } else cs = findCodeSpan(s, i, n);
       if (cs !== null) {
         flush(i);
         const tmp = [];
@@ -735,6 +831,9 @@ function inlineTo(s, refs, out, noExt) {
       const linkText = s.slice(br[1] + 1, i);
       const suf = parseLinkSuffix(s, i + 1, n, refs, linkText);
       if (suf === null) { i++; continue; }
+      // a link whose text is not a valid _inlineLabel does not form (cm-342);
+      // shortcuts use the permissive _blockLabel instead (suf.end === i+1)
+      if (suf.end > i + 1 && !isValidLabel(linkText)) { i++; continue; }
       const innerOut = [];
       // marked's De(): link text is lexed with inLink forced on, then the
       // outer inLink is restored — a tag inside link text must not leak state.
