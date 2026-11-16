@@ -994,6 +994,22 @@ function stripIndent(line, cols) {
   }
   return res + line.slice(j);
 }
+// List-item dedent (marked): expand leading tabs to spaces (tab stops from
+// column 0), then remove `cols` characters. A tab that straddles the strip
+// point becomes spaces — never a literal tab (unlike stripPrefix, which
+// preserves a tab whose width is unchanged).
+function stripListPrefix(line, cols) {
+  let col = 0, i = 0, exp = '';
+  while (i < line.length) {
+    const ch = line.charCodeAt(i);
+    if (ch === 32) { exp += ' '; col++; i++; }
+    else if (ch === 9) { const adv = 4 - (col % 4); exp += ' '.repeat(adv); col += adv; i++; }
+    else break;
+  }
+  const rest = line.slice(i);
+  if (exp.length >= cols) return exp.slice(cols) + rest;
+  return rest;
+}
 // Remove `cols` columns from the start of a line, including non-whitespace
 // marker chars (container prefixes: `>`, `-`, `1.`). Same tab handling.
 function stripPrefix(line, cols) {
@@ -1268,11 +1284,21 @@ function tryFence(lines, i, end) {
     j++;
   }
   const closeIdx = j < end ? j : end;
-  // content lines: strip up to `ind` columns; drop ONE trailing empty line
+  // Content lines: marked's Dt strips up to N leading whitespace CHARACTERS
+  // (N = the fence line's leading-whitespace length), and only for backtick
+  // fences — tilde fences keep their content verbatim (indentCodeCompensation
+  // only matches ```). A tab counts as ONE character here, not 4 columns.
   const content = [];
-  for (let k = i + 1; k < closeIdx; k++) content.push(stripIndent(lines[k], ind));
+  const strip = ch === 96 ? idx : 0;
+  for (let k = i + 1; k < closeIdx; k++) content.push(stripFenceIndent(lines[k], strip));
   if (content.length > 0 && content[content.length - 1] === '') content.pop();
   return { end: closeIdx < end ? closeIdx + 1 : end, lang, content };
+}
+// Remove up to n leading whitespace characters (spaces/tabs count as 1).
+function stripFenceIndent(line, n) {
+  let i = 0;
+  while (i < line.length && i < n && (line.charCodeAt(i) === 32 || line.charCodeAt(i) === 9)) i++;
+  return line.slice(i);
 }
 // Render a fenced/indented code block's content lines.
 function codeBlockHtml(content, lang) {
@@ -1666,7 +1692,7 @@ function parseList(lines, i, end, refs, endsNL, inList) {
         if (blankRun > 0 && tryRefDef(lines, k, end)) loose = true;
         for (let b = 0; b < blankRun; b++) { itemLines.push(''); paraOpen = false; }
         blankRun = 0;
-        const stripped = stripPrefix(l2, contentCols);
+        const stripped = stripListPrefix(l2, contentCols);
         itemLines.push(stripped);
         paraOpen = paraOpenAfter(stripped, paraOpen);
         hasContent = true;
