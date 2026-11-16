@@ -497,13 +497,13 @@ function trimExtUrl(s, a, b) {
 }
 // Try to match an extended autolink at s[i]. Returns [end, href, textStart, textEnd] or null.
 // i must be at the start of www. / scheme / mailto: / email local part.
-function matchExtAutolink(s, i, n) {
+function matchExtAutolink(s, i, n, stopBracket) {
   const c = s.charCodeAt(i);
   // www. (lowercase only: Www. / WWW. do not link)
   if (c === 119 && s.slice(i, i + 4) === 'www.') {
     if (i > 0) { const p = s.charCodeAt(i - 1); if (isWordChar(p) || p === 47) return null; }
     let j = i;
-    while (j < n) { const d = s.charCodeAt(j); if (d === 32 || d === 9 || d === 10 || d === 60) break; j++; }
+    while (j < n) { const d = s.charCodeAt(j); if (d === 32 || d === 9 || d === 10 || d === 60 || (stopBracket && d === 93)) break; j++; }
     const e = trimExtUrl(s, i, j);
     if (e <= i + 4) return null;
     return [e, 'http://' + s.slice(i, e), i, e];
@@ -516,7 +516,7 @@ function matchExtAutolink(s, i, n) {
   else if (rest.startsWith('ftp://')) schemeLen = 6;
   if (schemeLen > 0) {
     let j = i;
-    while (j < n) { const d = s.charCodeAt(j); if (d === 32 || d === 9 || d === 10 || d === 60) break; j++; }
+    while (j < n) { const d = s.charCodeAt(j); if (d === 32 || d === 9 || d === 10 || d === 60 || (stopBracket && d === 93)) break; j++; }
     const e = trimExtUrl(s, i, j);
     if (e <= i + schemeLen) return null;
     return [e, s.slice(i, e), i, e];
@@ -610,6 +610,9 @@ function inlineTo(s, refs, out, noExt) {
   }
   let emailIdx = 0;
   const flush = (end) => { if (end > textStart) toks.push([0, textStart, end]); };
+  // true while inside an active '[' ... (a ']' there closes the link text,
+  // so an extended URL must stop before it)
+  const inBrackets = () => openers.length > 0 && toks[openers[openers.length - 1]][3];
   while (i < n) {
     while (emailIdx < emails.length && emails[emailIdx][0] < i) emailIdx++;
     if (emailIdx < emails.length && emails[emailIdx][0] === i) {
@@ -789,7 +792,7 @@ function inlineTo(s, refs, out, noExt) {
       i++; continue;
     }
     if (!noExt && (c === 119 || c === 87 || c === 104 || c === 72 || c === 102 || c === 70 || c === 109 || c === 77 || c === 120 || c === 88)) {
-      const m = matchExtAutolink(s, i, n);
+      const m = matchExtAutolink(s, i, n, inBrackets());
       if (m !== null) {
         flush(i);
         const href = cleanUrl(m[1]);
@@ -1347,7 +1350,13 @@ function parseBlocks(lines, start, end, refs, noP, endsNL, inList) {
           while (j < end && !isBlank(lines[j])) j++;
         }
         const blines = lines.slice(i, j);
-        const trailNL = (j < end && !isBlank(lines[j])) || (j >= end && endsNL);
+        // trailing newline: types 1-5 add one iff the next line is not the
+        // empty string (a whitespace-only line still counts); types 6-7
+        // (which end at a blank line) only when the block is last and the
+        // text ends with a newline
+        const trailNL = hb.type <= 5
+          ? (j < end && lines[j] !== '') || (j >= end && endsNL)
+          : (j < end && !isBlank(lines[j])) || (j >= end && endsNL);
         blocks.push({ html: blines.join('\n') + (trailNL ? '\n' : ''), start: i, end: j, kind: 'html' });
         i = j; continue;
       }
