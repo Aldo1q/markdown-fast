@@ -17,33 +17,6 @@ function isPunctU(ch) { const c = ch.charCodeAt(0); return c < 128 ? isPunct(c) 
 const SPACE_RE = /\s/;
 function isSpaceU(ch) { const c = ch.charCodeAt(0); return c < 128 ? isSpace(c) : SPACE_RE.test(ch); }
 
-// marked's Lexer#maskSrc (Tokenizer/Lexer.ts): the string emStrong/del scan,
-// with link/code/html spans flattened so delimiters inside them are invisible.
-// Step 1 (reflinks that resolve) is intentionally omitted: a resolved ref
-// forms a link here and its text is re-lexed separately, which is equivalent.
-// Step 2 masks escapes (\punct -> '+') and the backticks inside code spans.
-// Step 3 (blockSkip) flattens inline links, code spans and html to [aaa...].
-// The mask is same-length as the input, so a delimiter at i is hidden iff
-// masked[i] !== s[i]. This is what hides the '_' inside a [...](...) whose
-// label holds a code span with a backtick in its content (the inner backtick
-// is repaired to '+' first, so blockSkip then matches the would-be link),
-// and the '__' after a link whose text holds a stray backtick (that backtick
-// pairs with a later backtick as a giant code span in the masked view).
-const _maskPunctRe = /(`+)(?:[^`]|[^`][\s\S]*?[^`])\1(?!`)|`+|\\([\p{P}\p{S}])/gu;
-const _maskBlockSkipRe = /\[(?:[^\[\]`]|(?<a>`+)[^`]+?\k<a>(?!`))*?\]\((?:\\[\s\S]|[^\\\(\)]|\((?:\\[\s\S]|[^\\\(\)])*\))*\)|(?<!`)()(?<b>`+)[^`]+?\k<b>(?!`)|<(?! )[^<>]*?>/g;
-function maskSrc(s) {
-  let m = s.replace(_maskPunctRe, (match0, code, punct) => {
-    if (punct !== undefined) return '+'.repeat(match0.length);
-    if (code !== undefined) return code + match0.slice(code.length, -code.length).replace(/`/g, '+') + code;
-    return match0;
-  });
-  m = m.replace(_maskBlockSkipRe, (match0, _a, context) => {
-    const offset = context ? context.length : 0;
-    return match0.slice(0, offset) + '[' + 'a'.repeat(Math.max(0, match0.length - offset - 2)) + ']';
-  });
-  return m;
-}
-
 // Decode one NUMERIC entity starting at s[i] === '&'. Named entities are
 // NOT decoded by marked (they pass through literally); only &#123; / &#x1F600;
 // (1-7 decimal digits, 1-6 hex digits) decode. Returns [decoded, next] or null.
@@ -701,20 +674,44 @@ function flank(s, i, len) {
 // until a matching </a>. Persists across paragraphs for the whole document.
 // Reset at the start of each parse() pass. Plain-text (alt) rendering must
 // not disturb it (marked renders alt with the text renderer, no lexing).
+// Emphasis mask (marked Lexer#maskSrc): before the emStrong/del scan, link,
+// code-span and html spans are flattened, so delimiters inside them are
+// invisible to emphasis. Replicated here as a per-position mask: a delimiter
+// at position i is hidden iff the masked source differs from s at i (all
+// three mask steps are length-preserving, so positions line up). Step 1 of
+// #maskSrc (reflink masking) is omitted: it only masks labels that resolve
+// in tokens.links, and our failing cases are all inline-link / code-span
+// driven. The mask is only computed when a delimiter and a span opener
+// ([, backtick or <) both occur in the string.
+const MASK_PUNCT = /(`+)(?:[^`]|[^`][\s\S]*?[^`])\1(?!`)|`+|\\([\p{P}\p{S}])/gu;
+const MASK_SKIP = /\[(?:[^\[\]`]|(?<a>`+)[^`]+\k<a>(?!`))*?\]\((?:\\[\s\S]|[^\\\(\)]|\((?:\\[\s\S]|[^\\\(\)])*\))*\)|(?<!`)()(?<b>`+)[^`]+\k<b>(?!`)|<(?! )[^<>]*?>/g;
+function maskSrc(s) {
+  // step 2: neutralise escapes and inner backticks of code spans
+  let t = s.replace(MASK_PUNCT, (m, code, punct) => punct ? '+'.repeat(m.length) : code ? code + m.slice(code.length, -code.length).replace(/`/g, '+') + code : m);
+  // step 3: flatten each link / code-span / html match to [aaa...]
+  t = t.replace(MASK_SKIP, (m, _a, context) => { const off = context ? context.length : 0; return m.slice(0, off) + '[' + 'a'.repeat(m.length - off - 2) + ']'; });
+  return t;
+}
 let INLINK = false;
 // Pass 1 (ref collection) discards all HTML, so inline rendering there is
-// pure waste; block structure and ref collection never read inline output.
+// pure waste: block structure and ref collection never read inline output
+// (tryRefDef / paraOpenAfter / isParaLine are all line-based), and inlineTo's
+// return value is only used inside inlineTo itself (link-text recursion).
 let SKIP_INLINE = false;
 
 function inlineTo(s, refs, out, noExt) {
   if (SKIP_INLINE) return false;
   const n = s.length;
+  // mask for this inline run (null when no delimiter can be hidden)
+  let masked = null;
+  if ((s.includes('*') || s.includes('_') || s.includes('~')) && (s.includes('[') || s.includes('`') || s.includes('<'))) {
+    const ms = maskSrc(s);
+    masked = new Uint8Array(n);
+    for (let p = 0; p < n; p++) if (ms.charCodeAt(p) !== s.charCodeAt(p)) masked[p] = 1;
+  }
   const toks = [];
   const openers = [];
   let formedLink = false;
-  // Masked view for emphasis/del (marked's Lexer#maskSrc): delimiters whose
-  // position was flattened by the mask are invisible to emStrong/del.
-  const masked = (s.includes('*') || s.includes('_') || s.includes('~')) ? maskSrc(s) : null;
   let i = 0, textStart = 0, pendingBang = false;
   // Pre-scan for extended emails: their local part can contain '_' which the
   // main loop would otherwise tokenize as an emphasis delimiter first.
@@ -813,6 +810,7 @@ function inlineTo(s, refs, out, noExt) {
       continue;
     }
     if (c === 42 || c === 95 || c === 126) { // * _ ~
+      if (masked !== null && masked[i]) { i++; continue; } // hidden by the mask: literal text
       let j = i;
       while (j < n && s.charCodeAt(j) === c) j++;
       const len = j - i;
@@ -821,9 +819,6 @@ function inlineTo(s, refs, out, noExt) {
       let canOpen, canClose;
       if (c === 95) { canOpen = fl[0] && (!fl[1] || fl[2]); canClose = fl[1] && (!fl[0] || fl[3]); }
       else { canOpen = fl[0]; canClose = fl[1]; }
-      // Hidden by the mask (inside a link/code/html span in marked's view):
-      // never an opener or closer, renders literally.
-      if (masked !== null && masked[i] !== s[i]) { canOpen = false; canClose = false; }
       flush(i);
       const pt = pendByPos.get(i);
       if (pt !== undefined) pt[4] = toks.length;
@@ -2013,14 +2008,15 @@ function parseList(lines, i, end, refs, endsNL, inList) {
   // loose if any item contains two blocks separated by a blank line
   // item content is parsed with inList=true: a nested ordered list may
   // interrupt a paragraph regardless of its start number
-  // INLINK is document-order state (an unclosed <a> suppresses later
-  // bare-URL autolinks). Items are parsed up to three times (looseness
-  // probe, noP re-parse, task re-parse); a re-parse must start from the
-  // state at that item's start, not the state a previous parse left behind
-  // after lexing later content (e.g. a </a> in a later item would otherwise
-  // re-enable autolinks in an earlier item's re-parse).
-  const itemStartINLINK = [];
-  let parsed = items.map((it) => { itemStartINLINK.push(INLINK); return parseBlocks(it.lines, 0, it.lines.length, refs, false, false, true); });
+  // INLINK is lexer state (marked: set by <a, cleared by </a>, persists
+  // across blocks). A list item is parsed up to 3x here (first parse,
+  // tight re-parse, task re-parse), so record each item's INLINK value at
+  // its first parse and restore it before every re-parse; otherwise a
+  // later <a>...</a> pair seen between parses leaks into the re-parse and
+  // a bare www./URL that marked leaves plain gets linked.
+  const inlinkStart = [];
+  let parsed = items.map((it) => { inlinkStart.push(INLINK); return parseBlocks(it.lines, 0, it.lines.length, refs, false, false, true); });
+  const inlinkEnd = INLINK;
   if (!loose) {
     for (let t = 0; t < items.length; t++) {
       const bl = parsed[t];
@@ -2033,8 +2029,7 @@ function parseList(lines, i, end, refs, endsNL, inList) {
       if (loose) break;
     }
   }
-  if (!loose) parsed = items.map((it, t) => { INLINK = itemStartINLINK[t]; const r = parseBlocks(it.lines, 0, it.lines.length, refs, true, false, true); if (t + 1 < items.length) itemStartINLINK[t + 1] = INLINK; return r; });
-  const listEndINLINK = INLINK;
+  if (!loose) parsed = items.map((it, t) => { INLINK = inlinkStart[t]; return parseBlocks(it.lines, 0, it.lines.length, refs, true, false, true); });
   let html = ordered ? (lm0.start !== 1 ? '<ol start="' + lm0.start + '">\n' : '<ol>\n') : '<ul>\n';
   for (let t = 0; t < items.length; t++) {
     let li = '<li>';
@@ -2047,7 +2042,7 @@ function parseList(lines, i, end, refs, endsNL, inList) {
       inputHtml = checked ? '<input checked="" disabled="" type="checkbox"> ' : '<input disabled="" type="checkbox"> ';
       // strip the checkbox marker from the item's first line and re-parse
       items[t].lines[0] = first.slice(tm[0].length);
-      INLINK = itemStartINLINK[t];
+      INLINK = inlinkStart[t];
       parsed[t] = parseBlocks(items[t].lines, 0, items[t].lines.length, refs, !loose, false, true);
     }
     if (inputHtml) {
@@ -2062,8 +2057,8 @@ function parseList(lines, i, end, refs, endsNL, inList) {
     li += '</li>\n';
     html += li;
   }
-  INLINK = listEndINLINK;
   html += ordered ? '</ol>\n' : '</ul>\n';
+  INLINK = inlinkEnd; // list-end state, as after the first parse of all items
   return { html, end: listEnd };
 }
 export function parse(markdown) {
