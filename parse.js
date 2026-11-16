@@ -431,7 +431,11 @@ function scanImageText(s, i, n) {
 function isExtLocal(c) { return isAlnum(c) || c === 46 || c === 95 || c === 43 || c === 45; }
 function isWordChar(c) { return isAlnum(c) || c === 95; }
 // Try to match an extended email at s[i] (i at local-part start). Returns [end] or null.
-function matchExtEmail(s, i, n) {
+// With wantPending, an email followed by '_' returns [end, usPos] instead of
+// null: the '_' may be a closing emphasis delimiter (the email is lexed
+// inside the emphasis in marked, so the '_' is already consumed there).
+// The caller resolves such a pending email after emphasis resolution.
+function matchExtEmail(s, i, n, wantPending) {
   let j = i;
   while (j < n && isExtLocal(s.charCodeAt(j))) j++;
   if (j === i || j >= n || s.charCodeAt(j) !== 64) return null;
@@ -439,7 +443,7 @@ function matchExtEmail(s, i, n) {
   while (d < n) {
     const c = s.charCodeAt(d);
     if (isAlnum(c) || c === 45) { label++; d++; continue; }
-    if (c === 46) { if (label === 0) return null; dots++; label = 0; d++; continue; }
+    if (c === 46) { if (label === 0) break; dots++; label = 0; d++; continue; }
     break;
   }
   // the domain must not end with a hyphen
@@ -448,7 +452,7 @@ function matchExtEmail(s, i, n) {
   while (d > j + 1 && s.charCodeAt(d - 1) === 46) { d--; dots--; }
   if (dots === 0) return null;
   // trailing boundary: next char must not be a word char or '-'
-  if (d < n) { const c = s.charCodeAt(d); if (isWordChar(c) || c === 45) return null; }
+  if (d < n) { const c = s.charCodeAt(d); if (c === 95 && wantPending) return [d, d]; if (isWordChar(c) || c === 45) return null; }
   return [d];
 }
 // Trim an extended URL match [a,b): entities, trailing punctuation, paren balance. Returns new end.
@@ -584,6 +588,13 @@ function flank(s, i, len) {
 // Node kinds: 0 text [0,a,b], 1 literal [1,str],
 // 2 delim [2,ch,len,canOpen,canClose,openTags,closeTags], 3 bracket [3,srcPos,bang,active]
 // Returns true if a link (not an image) was formed in this call.
+// Document-level lexer state (marked): once an <a ...> start tag is seen in
+// inline text, extended autolinks (www / scheme / bare email) are suppressed
+// until a matching </a>. Persists across paragraphs for the whole document.
+// Reset at the start of each parse() pass. Plain-text (alt) rendering must
+// not disturb it (marked renders alt with the text renderer, no lexing).
+let INLINK = false;
+
 function inlineTo(s, refs, out, noExt) {
   const n = s.length;
   const toks = [];
@@ -595,6 +606,7 @@ function inlineTo(s, refs, out, noExt) {
   // (An email inside a code span / link is skipped by the main loop's jumps.)
   // noExt (link text): extended autolinks are not recognized inside link text.
   const emails = [];
+  const pends = []; // [start, end, usPos]: email followed by '_' (pending emphasis decision)
   if (!noExt) {
   for (let p = 0; p < n; p++) {
     if (s.charCodeAt(p) === 64) { // @
@@ -602,20 +614,27 @@ function inlineTo(s, refs, out, noExt) {
       while (k >= 0 && isExtLocal(s.charCodeAt(k))) k--;
       const st = k + 1;
       if (st < p) {
-        const em = matchExtEmail(s, st, n);
-        if (em !== null) { emails.push([st, em[0]]); p = em[0] - 1; }
+        const em = matchExtEmail(s, st, n, true);
+        if (em !== null) {
+          if (em.length === 2) pends.push([st, em[0], em[1]]);
+          else emails.push([st, em[0]]);
+          p = em[0] - 1;
+        }
       }
     }
   }
   }
   let emailIdx = 0;
+  let pendIdx = 0;
+  const pendToks = []; // pending-email tokens [4, start, end, usPos, delimTokIdx]
+  const pendByPos = new Map(); // usPos -> pending token
   const flush = (end) => { if (end > textStart) toks.push([0, textStart, end]); };
   // true while inside an active '[' ... (a ']' there closes the link text,
   // so an extended URL must stop before it)
   const inBrackets = () => openers.length > 0 && toks[openers[openers.length - 1]][3];
   while (i < n) {
     while (emailIdx < emails.length && emails[emailIdx][0] < i) emailIdx++;
-    if (emailIdx < emails.length && emails[emailIdx][0] === i) {
+    if (emailIdx < emails.length && emails[emailIdx][0] === i && !INLINK) {
       const en = emails[emailIdx][1]; emailIdx++;
       flush(i);
       const raw = s.slice(i, en);
@@ -624,6 +643,16 @@ function inlineTo(s, refs, out, noExt) {
       const t2 = []; escInto(t2, raw, 0, raw.length);
       toks.push([1, '<a href="' + t1.join('') + '">' + t2.join('') + '</a>']);
       i = en; textStart = i; continue;
+    }
+    while (pendIdx < pends.length && pends[pendIdx][0] < i) pendIdx++;
+    if (pendIdx < pends.length && pends[pendIdx][0] === i && !INLINK) {
+      const pd = pends[pendIdx]; pendIdx++;
+      flush(i);
+      const pt = [4, pd[0], pd[1], pd[2], -1];
+      toks.push(pt);
+      pendToks.push(pt);
+      pendByPos.set(pd[2], pt);
+      i = pd[1]; textStart = i; continue;
     }
     const c = s.charCodeAt(i);
     if (c === 92) { // backslash
@@ -667,6 +696,8 @@ function inlineTo(s, refs, out, noExt) {
       if (c === 95) { canOpen = fl[0] && (!fl[1] || fl[2]); canClose = fl[1] && (!fl[0] || fl[3]); }
       else { canOpen = fl[0]; canClose = fl[1]; }
       flush(i);
+      const pt = pendByPos.get(i);
+      if (pt !== undefined) pt[4] = toks.length;
       toks.push([2, c, len, canOpen, canClose, null, null]);
       i = j; textStart = i; continue;
     }
@@ -707,7 +738,12 @@ function inlineTo(s, refs, out, noExt) {
       const suf = parseLinkSuffix(s, i + 1, n, refs, linkText);
       if (suf === null) { i++; continue; }
       const innerOut = [];
+      // marked's De(): link text is lexed with inLink forced on, then the
+      // outer inLink is restored — a tag inside link text must not leak state.
+      const savedLink = INLINK;
+      INLINK = true;
       const innerHasLink = inlineTo(linkText, refs, innerOut, true);
+      INLINK = savedLink;
       if (innerHasLink) {
         for (let k = 0; k < openers.length; k++) toks[openers[k]][3] = false;
         i++; continue;
@@ -754,8 +790,11 @@ function inlineTo(s, refs, out, noExt) {
       }
       const tg = parseHtmlTag(s, i, n);
       if (tg !== -1) {
+        const tag = s.slice(i, tg);
+        if (/^<a /i.test(tag)) INLINK = true;
+        else if (INLINK && /^<\/a>/i.test(tag)) INLINK = false;
         flush(i);
-        toks.push([1, s.slice(i, tg)]);
+        toks.push([1, tag]);
         i = tg; textStart = i; continue;
       }
       i++; continue;
@@ -773,7 +812,7 @@ function inlineTo(s, refs, out, noExt) {
       }
       i++; continue;
     }
-    if (c === 64 && !noExt) { // @ : extended email, look back for local part
+    if (c === 64 && !noExt && !INLINK) { // @ : extended email, look back for local part
       let k = i - 1;
       while (k >= textStart && isExtLocal(s.charCodeAt(k))) k--;
       const start = k + 1;
@@ -791,7 +830,7 @@ function inlineTo(s, refs, out, noExt) {
       }
       i++; continue;
     }
-    if (!noExt && (c === 119 || c === 87 || c === 104 || c === 72 || c === 102 || c === 70 || c === 109 || c === 77 || c === 120 || c === 88)) {
+    if (!noExt && !INLINK && (c === 119 || c === 87 || c === 104 || c === 72 || c === 102 || c === 70 || c === 109 || c === 77 || c === 120 || c === 88)) {
       const m = matchExtAutolink(s, i, n, inBrackets());
       if (m !== null) {
         flush(i);
@@ -807,6 +846,21 @@ function inlineTo(s, refs, out, noExt) {
   }
   flush(n);
   resolveEmphasis(toks);
+  // Pending emails: the '_' after the domain links iff that delimiter run
+  // was used as a closer (the email sits inside the emphasis in marked).
+  for (let q = 0; q < pendToks.length; q++) {
+    const pt = pendToks[q];
+    const dt = pt[4] >= 0 ? toks[pt[4]] : null;
+    if (dt !== null && dt[6] !== null) {
+      const raw = s.slice(pt[1], pt[2]);
+      const href = 'mailto:' + raw;
+      const t1 = []; escAttrInto(t1, href, 0, href.length);
+      const t2 = []; escInto(t2, raw, 0, raw.length);
+      pt[0] = 1; pt[1] = '<a href="' + t1.join('') + '">' + t2.join('') + '</a>';
+    } else {
+      pt[0] = 0;
+    }
+  }
   // render
   for (let t = 0; t < toks.length; t++) {
     const tk = toks[t];
@@ -885,7 +939,9 @@ function decodeEntitiesInStr(str) {
 // tags stripped (img -> its alt), entities decoded.
 function plainText(s, refs) {
   const tmp = [];
+  const saved = INLINK;
   inlineTo(s, refs, tmp);
+  INLINK = saved;
   let html = tmp.join('');
   html = html.replace(/<img\b[^>]*?alt="([^"]*)"[^>]*>/g, '$1');
   html = html.replace(/<br>/g, '\n');
@@ -1696,8 +1752,10 @@ export function parse(markdown) {
   const endsNL = src.endsWith('\n');
   const refs = new Map();
   // pass 1: collect link reference definitions (document-global)
+  INLINK = false;
   parseBlocks(lines, 0, lines.length, refs, false, endsNL);
   // pass 2: render
+  INLINK = false;
   const blocks = parseBlocks(lines, 0, lines.length, refs, false, endsNL);
   let out = '';
   for (const b of blocks) out += b.html;
