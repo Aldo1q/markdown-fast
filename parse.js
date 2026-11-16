@@ -1815,7 +1815,12 @@ function paraOpenAfter(line, wasOpen) {
   if (ind > 3) return wasOpen; // indented: continuation if open, code if not
   const c = line.charCodeAt(idx);
   if (c === 35) return tryAtx(line, idx) === null;
-  if (c === 96 || c === 126) { let r = 0; while (line.charCodeAt(idx + r) === c) r++; return r < 3; }
+  if (c === 96 || c === 126) {
+    let r = 0; while (line.charCodeAt(idx + r) === c) r++;
+    // backtick fence with a backtick in the info is not a fence (paragraph)
+    if (r >= 3 && c === 96 && line.slice(idx + r).includes('`')) return true;
+    return r < 3;
+  }
   if (c === 62) {
     // nested quote: recurse into its content (fresh context)
     const spaceAfter = (line.charCodeAt(idx + 1) === 32 || line.charCodeAt(idx + 1) === 9) ? 1 : 0;
