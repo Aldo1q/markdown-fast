@@ -297,23 +297,21 @@ function isValidLabel(text) {
       }
       res = ok && validFrom(j + 1);
     } else if (c === 96) { // backtick
+      // alt 3 (code span): the content [^`]*? cannot hold a backtick, so the
+      // closer is the FIRST later backtick run — no backtracking to later runs
       let r = i;
       while (r < n && text.charCodeAt(r) === 96) r++;
       const runLen = r - i;
-      let done = false;
-      // code span: try each later backtick run as the closer (shortest first)
-      let j = r;
-      while (j < n && !done) {
-        const nb = text.indexOf('`', j);
-        if (nb === -1) break;
+      const nb = text.indexOf('`', r);
+      if (nb !== -1) {
         let m = nb;
         while (m < n && text.charCodeAt(m) === 96) m++;
-        if (validFrom(m)) { done = true; break; }
-        j = m;
+        res = validFrom(m);
+      } else if (runLen >= 2 && r === n) {
+        res = true; // alt 4: 2+ backticks at the very end (right before ']')
+      } else {
+        res = false;
       }
-      // 2+ backticks at the very end (right before ']')
-      if (!done && runLen >= 2 && r === n) done = true;
-      res = done;
     } else if (c === 93) {
       res = false; // bare ']' not allowed in a label
     } else {
@@ -792,7 +790,7 @@ function inlineTo(s, refs, out, noExt) {
       flush(i);
       const pt = pendByPos.get(i);
       if (pt !== undefined) pt[4] = toks.length;
-      toks.push([2, c, len, canOpen, canClose, null, null]);
+      toks.push([2, c, len, canOpen, canClose, null, null, i]);
       i = j; textStart = i; continue;
     }
     if (c === 33 && s.charCodeAt(i + 1) === 91) { // ![
@@ -942,7 +940,7 @@ function inlineTo(s, refs, out, noExt) {
     i++;
   }
   flush(n);
-  resolveEmphasis(toks);
+  resolveEmphasis(toks, s);
   // Pending emails: the '_' after the domain links iff that delimiter run
   // was used as a closer (the email sits inside the emphasis in marked).
   for (let q = 0; q < pendToks.length; q++) {
@@ -973,46 +971,195 @@ function inlineTo(s, refs, out, noExt) {
   }
   return formedLink;
 }
-// Emphasis / strikethrough resolution over the token list (delimiter stack algorithm).
-function resolveEmphasis(toks) {
-  const delims = [];
-  for (let idx = 0; idx < toks.length; idx++) if (toks[idx][0] === 2) delims.push(idx);
-  const spans = []; // [openerTokIdx, closerTokIdx] of formed emphasis (blocks cross-boundary matches)
-  for (let di = 0; di < delims.length; di++) {
-    const ci = delims[di];
-    const closer = toks[ci];
-    if (closer[2] === 0 || !closer[4]) continue; // [4] = canClose
-    while (closer[2] > 0) {
-      let oi = -1;
-      for (let dj = di - 1; dj >= 0; dj--) {
-        const oj = delims[dj];
-        const opener = toks[oj];
-        if (opener[2] === 0 || !opener[3]) continue; // [3] = canOpen
-        if (opener[1] !== closer[1]) continue;
-        // trapped inside a formed emphasis that ends before this closer?
-        let trapped = false;
-        for (let s = 0; s < spans.length; s++) {
-          if (spans[s][0] < oj && oj < spans[s][1] && spans[s][1] < ci) { trapped = true; break; }
+// Emphasis / strikethrough resolution — outermost-first scan mirroring
+// marked's emStrong (Tokenizer.ts): from each opener, scan forward with
+// delimTotal/midDelimTotal; left-only runs add, right-only subtract,
+// either-runs go through CommonMark rules 9-10 against the whole run.
+// A failed '**' opener is retried one '*' at a time (mid-run openers pair
+// only with right-only closers). A lone '*' inside '__...__' (or '_' inside
+// '**...**') at the scan start is skipped (skip-orphan).
+// When an opener forms using fewer chars than its run, the leftover chars
+// AFTER the used part belong to the content (inside the emphasis) and are
+// split off as a fresh delimiter token so they can nest.
+function resolveEmphasis(toks, s) {
+  const spans = []; // [openerTokIdx, closerTokIdx] of formed emphasis
+  const processed = new Set();
+  function insertTok(pos, tok) {
+    toks.splice(pos, 0, tok);
+    for (let k = 0; k < spans.length; k++) {
+      if (spans[k][0] >= pos) spans[k][0]++;
+      if (spans[k][1] >= pos) spans[k][1]++;
+    }
+    const np = new Set();
+    for (const p of processed) np.add(p >= pos ? p + 1 : p);
+    processed.clear();
+    for (const p of np) processed.add(p);
+  }
+  function crosses(oi, cj) {
+    for (let k = 0; k < spans.length; k++) {
+      const a = spans[k][0], b = spans[k][1];
+      if ((a < oi && oi < b) !== (a < cj && cj < b)) return true;
+    }
+    return false;
+  }
+  function container(ti) {
+    let best = null;
+    for (let k = 0; k < spans.length; k++) {
+      const a = spans[k][0], b = spans[k][1];
+      if (a < ti && ti < b && (best === null || a > best[0])) best = spans[k];
+    }
+    return best;
+  }
+  // Strikethrough first, closer-driven (nearest opener): marked nests dels
+  // inner-first (~~a ~~b~~ c~~ -> <del>a <del>b</del> c</del>).
+  {
+    const delims = [];
+    for (let idx = 0; idx < toks.length; idx++) if (toks[idx][0] === 2) delims.push(idx);
+    for (let di = 0; di < delims.length; di++) {
+      const ci = delims[di];
+      const closer = toks[ci];
+      if (closer[1] !== 126 || closer[2] === 0 || !closer[4]) continue;
+      while (closer[2] > 0) {
+        let oi = -1;
+        for (let dj = di - 1; dj >= 0; dj--) {
+          const oj = delims[dj];
+          const opener = toks[oj];
+          if (opener[1] !== 126 || opener[2] === 0 || !opener[3]) continue;
+          if (opener[2] !== closer[2]) continue;
+          if (crosses(oj, ci)) continue;
+          oi = oj; break;
         }
-        if (trapped) continue;
-        if (closer[1] === 126) { if (opener[2] !== closer[2]) continue; }
-        else if ((opener[3] && opener[4]) || (closer[3] && closer[4])) {
-          // rule of 3: applies when EITHER delimiter can both open and close
-          if ((opener[2] + closer[2]) % 3 === 0 && opener[2] % 3 !== 0) continue;
-        }
-        oi = oj; break;
+        if (oi === -1) break;
+        const opener = toks[oi];
+        if (opener[5] === null) opener[5] = [];
+        if (closer[6] === null) closer[6] = [];
+        opener[5].push('<del>');
+        closer[6].push('</del>');
+        opener[2] -= closer[2];
+        closer[2] = 0;
+        spans.push([oi, ci]);
       }
-      if (oi === -1) break;
-      const opener = toks[oi];
-      const use = closer[1] === 126 ? closer[2] : (opener[2] >= 2 && closer[2] >= 2 ? 2 : 1);
-      const tag = closer[1] === 126 ? 'del' : use === 2 ? 'strong' : 'em';
-      if (opener[5] === null) opener[5] = [];
-      if (closer[6] === null) closer[6] = [];
-      opener[5].push('<' + tag + '>');
-      closer[6].push('</' + tag + '>');
-      opener[2] -= use;
-      closer[2] -= use;
-      spans.push([oi, ci]);
+    }
+  }
+  for (;;) {
+    // first unprocessed opener in token order (outermost-first)
+    let delims = null, oi = -1, opener = null;
+    for (let idx = 0; idx < toks.length; idx++) {
+      const tk = toks[idx];
+      if (tk[0] === 2 && tk[2] > 0 && tk[3] && !processed.has(idx)) { oi = idx; opener = tk; break; }
+    }
+    if (oi === -1) break;
+    processed.add(oi);
+    const ch = opener[1];
+    if (ch === 126) continue; // strikethrough handled above
+    const srcPos = opener[7];
+    const b = charBefore(s, srcPos);
+    const bSp = b === '' ? true : isSpaceU(b);
+    const bPu = b === '' ? false : isPunctU(b);
+    const a = charAfter(s, srcPos + opener[2]);
+    const openerCanClose = !bSp && (a !== '' || (ch === 42 && !bPu));
+    const cont = container(oi);
+    const scanEnd = cont ? cont[1] : Infinity;
+    delims = [];
+    for (let idx = 0; idx < toks.length; idx++) if (toks[idx][0] === 2) delims.push(idx);
+    // skip-orphan: lone delim inside __...__ (for *) or **...** (for _),
+    // only at the scan start.
+    let orphan = -1;
+    const other = ch === 42 ? 95 : 42;
+    for (let dj = 0; dj < delims.length; dj++) {
+      const tj = toks[delims[dj]];
+      if (delims[dj] <= oi || tj[2] === 0) continue;
+      if (tj[1] === other && tj[2] >= 2) {
+        for (let dk = dj + 1; dk < delims.length; dk++) {
+          const tk = toks[delims[dk]];
+          if (tk[2] === 0) continue;
+          if (tk[1] === ch && tk[2] === 1) {
+            for (let dm = dk + 1; dm < delims.length; dm++) {
+              const tm = toks[delims[dm]];
+              if (tm[2] === 0) continue;
+              if (tm[1] === other && tm[2] >= 2) orphan = delims[dk];
+              break;
+            }
+          }
+          break;
+        }
+      }
+      break;
+    }
+    let formed = false;
+    for (let attempt = opener[2]; attempt >= 1 && !formed; attempt--) {
+      const midRun = attempt < opener[2];
+      const lLength = attempt;
+      const runLength = opener[2];
+      let delimTotal = lLength, midDelimTotal = 0;
+      for (let dj = 0; dj < delims.length; dj++) {
+        let cj = delims[dj];
+        if (cj <= oi || cj >= scanEnd) continue;
+        const r = toks[cj];
+        if (r[1] !== ch || r[2] === 0 || cj === orphan) continue;
+        if (!r[3] && !r[4]) continue;
+        const rLen = r[2];
+        const isLeft = r[3] && !r[4];
+        const isRight = !r[3] && r[4];
+        const isEither = r[3] && r[4];
+        if (isLeft) { delimTotal += rLen; continue; }
+        if (isEither || openerCanClose) {
+          if (midRun && isEither) break;
+          if (runLength % 3 !== 0 && (runLength + rLen) % 3 === 0) { midDelimTotal += rLen; continue; }
+        }
+        delimTotal -= rLen;
+        if (delimTotal > 0) continue;
+        if (crosses(oi, cj)) break;
+        const rLength = Math.min(rLen, rLen + delimTotal + midDelimTotal);
+        const use = Math.min(lLength, rLength) % 2 === 1 ? 1 : 2;
+        const tag = use === 2 ? 'strong' : 'em';
+        const L = opener[2];
+        const beforeLen = L - attempt;
+        const insideLen = attempt - use;
+        const closerInsideLen = rLength - use;
+        const closerOutsideLen = rLen - rLength;
+        const cSrcPos = r[7];
+        if (opener[5] === null) opener[5] = [];
+        if (r[6] === null) r[6] = [];
+        opener[5].push('<' + tag + '>');
+        r[6].push('</' + tag + '>');
+        opener[2] = beforeLen;
+        r[2] = 0;
+        spans.push([oi, cj]);
+        formed = true;
+        if (closerInsideLen > 0) {
+          // leftover closer chars inside the content (its end): split off
+          // as a fresh delimiter token right before the closer
+          const fl2 = flank(s, cSrcPos, closerInsideLen);
+          let co2, cc2;
+          if (ch === 95) { co2 = fl2[0] && (!fl2[1] || fl2[2]); cc2 = fl2[1] && (!fl2[0] || fl2[3]); }
+          else { co2 = fl2[0]; cc2 = fl2[1]; }
+          insertTok(cj, [2, ch, closerInsideLen, co2, cc2, null, null, cSrcPos]);
+          cj = cj + 1;
+        }
+        if (closerOutsideLen > 0) {
+          // tail of the closer run past the em: literal text after it, as a
+          // fresh delimiter token right after the closer
+          const outSrcPos = cSrcPos + rLength;
+          const fl3 = flank(s, outSrcPos, closerOutsideLen);
+          let co3, cc3;
+          if (ch === 95) { co3 = fl3[0] && (!fl3[1] || fl3[2]); cc3 = fl3[1] && (!fl3[0] || fl3[3]); }
+          else { co3 = fl3[0]; cc3 = fl3[1]; }
+          insertTok(cj + 1, [2, ch, closerOutsideLen, co3, cc3, null, null, outSrcPos]);
+        }
+        if (insideLen > 0) {
+          // leftover run chars belong to the content: split off as a fresh
+          // delimiter token right after the opener
+          const insPos = oi + 1;
+          const insSrcPos = srcPos + (L - attempt) + use;
+          const fl = flank(s, insSrcPos, insideLen);
+          let canOpen2, canClose2;
+          if (ch === 95) { canOpen2 = fl[0] && (!fl[1] || fl[2]); canClose2 = fl[1] && (!fl[0] || fl[3]); }
+          else { canOpen2 = fl[0]; canClose2 = fl[1]; }
+          insertTok(insPos, [2, ch, insideLen, canOpen2, canClose2, null, null, insSrcPos]);
+        }
+        break;
+      }
     }
   }
 }
