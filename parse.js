@@ -455,48 +455,46 @@ function matchExtEmail(s, i, n, wantPending) {
   if (d < n) { const c = s.charCodeAt(d); if (c === 95 && wantPending) return [d, d]; if (isWordChar(c) || c === 45) return null; }
   return [d];
 }
-// Trim an extended URL match [a,b): entities, trailing punctuation, paren balance. Returns new end.
-function trimExtUrl(s, a, b) {
-  for (let iter = 0; iter < 3; iter++) {
-    let changed = false;
-    // trailing entity &...;
-    if (b > a && s.charCodeAt(b - 1) === 59) {
-      let k = b - 2;
-      while (k >= a && isAlnum(s.charCodeAt(k))) k--;
-      if (k >= a && s.charCodeAt(k) === 38 && (k === a || s.charCodeAt(k - 1) !== 38)) {
-        const name = s.slice(k + 1, b - 1);
-        if (name.length > 0 && (name[0] === '#' || isAlpha(name.charCodeAt(0)))) {
-          // only trim if it looks like an entity (name or #num or #xhex)
-          let ok = false;
-          if (name[0] === '#') {
-            if (name.length > 1 && (name[1] === 'x' || name[1] === 'X')) ok = /^[0-9a-fA-F]+$/.test(name.slice(2));
-            else ok = /^[0-9]+$/.test(name.slice(1));
-          } else ok = /^[A-Za-z0-9]+$/.test(name);
-          if (ok) { b = k; changed = true; }
-        }
-      }
-      if (changed) continue;
+// Punctuation in marked's _backpedal: ? ! . , : ; * _ ' " ~ )
+function isBackpedalPunct(c) {
+  return c === 63 || c === 33 || c === 46 || c === 44 || c === 58 || c === 59 || c === 42 || c === 95 || c === 39 || c === 34 || c === 126 || c === 41;
+}
+// Marked's _backpedal, as a scanner: the longest prefix of [a,b) that
+// decomposes into ordinary chars (not ?!.,:;*_'\"~()&), balanced (...) groups,
+// an & that does not start an &name; entity ending at b, or trailing
+// punctuation that is NOT at the end. A ')' is kept when it closes a
+// balanced group (e.g. ...%5D(...)) or is followed by more URL text.
+function backpedalEnd(s, a, b) {
+  let i = a;
+  while (i < b) {
+    const c = s.charCodeAt(i);
+    if (c === 40) { // '(' — balanced group \([^)]*\)
+      let j = i + 1;
+      while (j < b && s.charCodeAt(j) !== 41) j++;
+      if (j < b) { i = j + 1; continue; }
+      break; // unmatched '(' stops the match
     }
-    // trailing punctuation ? ! . , : * _ ~ ;
-    while (b > a) {
-      const c = s.charCodeAt(b - 1);
-      if (c === 63 || c === 33 || c === 46 || c === 44 || c === 58 || c === 42 || c === 95 || c === 126 || c === 59) { b--; changed = true; }
-      else break;
+    if (c === 38) { // '&' — excluded if it starts an &name; entity ending at b
+      let j = i + 1;
+      while (j < b && isAlnum(s.charCodeAt(j))) j++;
+      if (j > i + 1 && j < b && s.charCodeAt(j) === 59 && j + 1 === b) break;
+      i++;
+      continue;
     }
-    // paren balance
-    let open = 0, close = 0, firstUnmatched = -1;
-    const stack = [];
-    for (let k = a; k < b; k++) {
-      const c = s.charCodeAt(k);
-      if (c === 40) { open++; stack.push(k); }
-      else if (c === 41) { close++; if (stack.length) stack.pop(); }
+    if (isBackpedalPunct(c)) {
+      let j = i;
+      while (j < b && isBackpedalPunct(s.charCodeAt(j))) j++;
+      if (j < b) { i = j; continue; } // followed by more: keep the run
+      break; // run is at the end: exclude it
     }
-    if (open > close && stack.length) { b = stack[0]; changed = true; }
-    else if (close > open) {
-      while (b > a && s.charCodeAt(b - 1) === 41 && close > open) { b--; close--; changed = true; }
-    }
-    if (!changed) break;
+    i++; // ordinary char
   }
+  return i;
+}
+// Trim an extended URL match [a,b): apply the backpedal repeatedly until stable.
+function trimExtUrl(s, a, b) {
+  let prev = -1;
+  while (prev !== b) { prev = b; b = backpedalEnd(s, a, b); }
   return b;
 }
 // Try to match an extended autolink at s[i]. Returns [end, href, textStart, textEnd] or null.
